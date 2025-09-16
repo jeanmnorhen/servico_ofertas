@@ -1,44 +1,73 @@
 import os
 import json
+import base64
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
-import firebase_admin
-from firebase_admin import credentials, auth, firestore
-from confluent_kafka import Producer
+from flask_cors import CORS
 
+try:
+    import firebase_admin
+    from firebase_admin import credentials, auth, firestore
+except ImportError:
+    firebase_admin = None
+
+try:
+    from confluent_kafka import Producer
+except ImportError:
+    Producer = None
+
+# --- Variáveis globais para erros de inicialização ---
+firebase_init_error = None
+kafka_init_error = None
+
+# --- Configuração do Flask ---
 app = Flask(__name__)
 CORS(app)
 
-# --- Inicialização do Firebase Admin SDK ---
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-cred_path = os.path.join(project_root, 'firebase-adminsdk.json')
-
+# --- Inicialização do Firebase Admin SDK (PADRONIZADO) ---
 db = None
-if not firebase_admin._apps:
+if firebase_admin:
     try:
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
+        base64_sdk = os.environ.get('FIREBASE_ADMIN_SDK_BASE64')
+        if base64_sdk:
+            decoded_sdk = base64.b64decode(base64_sdk).decode('utf-8')
+            cred_dict = json.loads(decoded_sdk)
+            cred = credentials.Certificate(cred_dict)
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            print("Firebase inicializado com sucesso via Base64.")
+        else:
+            firebase_init_error = "Variável de ambiente FIREBASE_ADMIN_SDK_BASE64 não encontrada."
+            print(firebase_init_error)
     except Exception as e:
+        firebase_init_error = str(e)
         print(f"Erro ao inicializar o Firebase Admin SDK: {e}")
+else:
+    firebase_init_error = "Biblioteca firebase_admin não encontrada."
 
 # --- Configuração do Kafka Producer ---
 producer = None
-try:
-    kafka_conf = {
-        'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVER'),
-        'security.protocol': 'SASL_SSL',
-        'sasl.mechanisms': 'PLAIN',
-        'sasl.username': os.environ.get('KAFKA_API_KEY'),
-        'sasl.password': os.environ.get('KAFKA_API_SECRET')
-    }
-    if kafka_conf['bootstrap.servers']:
-        producer = Producer(kafka_conf)
-        print("Produtor Kafka inicializado com sucesso.")
-    else:
-        print("Variáveis de ambiente do Kafka não encontradas.")
-except Exception as e:
-    print(f"Erro ao inicializar Produtor Kafka: {e}")
+if Producer:
+    try:
+        kafka_conf = {
+            'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVER'),
+            'security.protocol': 'SASL_SSL',
+            'sasl.mechanisms': 'PLAIN',
+            'sasl.username': os.environ.get('KAFKA_API_KEY'),
+            'sasl.password': os.environ.get('KAFKA_API_SECRET')
+        }
+        if kafka_conf['bootstrap.servers']:
+            producer = Producer(kafka_conf)
+            print("Produtor Kafka inicializado com sucesso.")
+        else:
+            kafka_init_error = "Variáveis de ambiente do Kafka não encontradas."
+            print(kafka_init_error)
+    except Exception as e:
+        kafka_init_error = str(e)
+        print(f"Erro ao inicializar Produtor Kafka: {e}")
+else:
+    kafka_init_error = "Biblioteca confluent_kafka não encontrada."
 
 def delivery_report(err, msg):
     if err is not None:
@@ -69,27 +98,26 @@ def publish_event(topic, event_type, offer_id, data, changes=None):
 
 @app.route("/api/offers", methods=["POST"])
 def create_offer():
-    """Cria uma nova oferta, verificando se o usuário é dono do produto."""
-    # 1. Autenticação
+    if not db:
+        return jsonify({"error": "Dependência do Firestore não inicializada."}), 503
+
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return jsonify({"error": "Authorization token is required"}), 401
 
-    id_token = auth_header.split('Bearer ')[1]
     try:
+        id_token = auth_header.split('Bearer ')[1]
         decoded_token = auth.verify_id_token(id_token)
         uid = decoded_token['uid']
     except Exception as e:
         return jsonify({"error": "Invalid or expired token", "details": str(e)}), 401
 
-    # 2. Validação dos Dados de Entrada
     offer_data = request.get_json()
     if not offer_data or not offer_data.get('product_id') or not offer_data.get('offer_price'):
         return jsonify({"error": "Product ID and offer price are required"}), 400
     
     product_id = offer_data['product_id']
 
-    # 3. Autorização: Verifica se o usuário autenticado é o dono do produto
     try:
         product_ref = db.collection('products').document(product_id)
         product_doc = product_ref.get()
@@ -99,13 +127,11 @@ def create_offer():
         if product_doc.to_dict().get('owner_uid') != uid:
             return jsonify({"error": "User is not authorized to create offers for this product"}), 403
         
-        # Adiciona o store_id do produto na oferta para referência futura
         offer_data['store_id'] = product_doc.to_dict().get('store_id')
 
     except Exception as e:
         return jsonify({"error": "Could not verify product ownership", "details": str(e)}), 500
 
-    # 4. Lógica de Negócio: Cria a oferta
     try:
         offer_to_create = offer_data.copy()
         offer_to_create['owner_uid'] = uid
@@ -120,9 +146,8 @@ def create_offer():
 
 @app.route('/api/offers/<offer_id>', methods=['GET'])
 def get_offer(offer_id):
-    """Retorna os dados de uma oferta."""
     if not db:
-        return jsonify({"error": "Dependências de banco de dados não inicializadas."}), 503
+        return jsonify({"error": "Dependência do Firestore não inicializada."}), 503
 
     try:
         offer_doc = db.collection('offers').document(offer_id).get()
@@ -136,14 +161,15 @@ def get_offer(offer_id):
 
 @app.route('/api/offers/<offer_id>', methods=['PUT'])
 def update_offer(offer_id):
-    """Atualiza os dados de uma oferta, verificando se o usuário é dono."""
-    # 1. Autenticação
+    if not db:
+        return jsonify({"error": "Dependência do Firestore não inicializada."}), 503
+
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return jsonify({"error": "Authorization token is required"}), 401
 
-    id_token = auth_header.split('Bearer ')[1]
     try:
+        id_token = auth_header.split('Bearer ')[1]
         decoded_token = auth.verify_id_token(id_token)
         uid = decoded_token['uid']
     except Exception as e:
@@ -160,7 +186,6 @@ def update_offer(offer_id):
         if not offer_doc.exists:
             return jsonify({"error": "Oferta não encontrada."}), 404
         
-        # 2. Autorização: Verifica se o usuário autenticado é o dono da oferta
         if offer_doc.to_dict().get('owner_uid') != uid:
             return jsonify({"error": "User is not authorized to update this offer"}), 403
 
@@ -175,14 +200,15 @@ def update_offer(offer_id):
 
 @app.route('/api/offers/<offer_id>', methods=['DELETE'])
 def delete_offer(offer_id):
-    """Deleta uma oferta, verificando se o usuário é dono."""
-    # 1. Autenticação
+    if not db:
+        return jsonify({"error": "Dependência do Firestore não inicializada."}), 503
+
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return jsonify({"error": "Authorization token is required"}), 401
 
-    id_token = auth_header.split('Bearer ')[1]
     try:
+        id_token = auth_header.split('Bearer ')[1]
         decoded_token = auth.verify_id_token(id_token)
         uid = decoded_token['uid']
     except Exception as e:
@@ -195,7 +221,6 @@ def delete_offer(offer_id):
         if not offer_doc.exists:
             return jsonify({"error": "Oferta não encontrada."}), 404
         
-        # 2. Autorização: Verifica se o usuário autenticado é o dono da oferta
         if offer_doc.to_dict().get('owner_uid') != uid:
             return jsonify({"error": "User is not authorized to delete this offer"}), 403
 
@@ -210,13 +235,30 @@ def delete_offer(offer_id):
 # --- Health Check (para Vercel) ---
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    status = {
-        "firestore": "ok" if db else "error",
-        "kafka_producer": "ok" if producer else "error"
+    env_vars = {
+        "FIREBASE_ADMIN_SDK_BASE64": "present" if os.environ.get('FIREBASE_ADMIN_SDK_BASE64') else "missing",
+        "KAFKA_BOOTSTRAP_SERVER": "present" if os.environ.get('KAFKA_BOOTSTRAP_SERVER') else "missing",
+        "KAFKA_API_KEY": "present" if os.environ.get('KAFKA_API_KEY') else "missing",
+        "KAFKA_API_SECRET": "present" if os.environ.get('KAFKA_API_SECRET') else "missing"
     }
-    http_status = 200 if all(s == "ok" for s in status.values()) else 503
+    status = {
+        "environment_variables": env_vars,
+        "dependencies": {
+            "firestore": "ok" if db else "error",
+            "kafka_producer": "ok" if producer else "error"
+        },
+        "initialization_errors": {
+            "firestore": firebase_init_error,
+            "kafka": kafka_init_error
+        }
+    }
+    all_ok = (
+        all(value == "present" for value in env_vars.values()) and
+        status["dependencies"]["firestore"] == "ok" and
+        status["dependencies"]["kafka_producer"] == "ok"
+    )
+    http_status = 200 if all_ok else 503
     return jsonify(status), http_status
 
 if __name__ == '__main__':
     app.run(debug=True)
-p.run(debug=True)
