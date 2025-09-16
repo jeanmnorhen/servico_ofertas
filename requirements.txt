@@ -1,0 +1,5 @@
+Flask
+pytest
+firebase-admin
+confluent-kafka
+Flask-Cors
