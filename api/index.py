@@ -18,7 +18,7 @@ except ImportError:
 
 # --- Variáveis globais para erros de inicialização ---
 firebase_init_error = None
-kafka_init_error = None
+kafka_producer_init_error = None # Renamed for clarity
 
 # --- Configuração do Flask ---
 app = Flask(__name__)
@@ -61,13 +61,13 @@ if Producer:
             producer = Producer(kafka_conf)
             print("Produtor Kafka inicializado com sucesso.")
         else:
-            kafka_init_error = "Variáveis de ambiente do Kafka não encontradas."
-            print(kafka_init_error)
+            kafka_producer_init_error = "Variáveis de ambiente do Kafka não encontradas."
+            print(kafka_producer_init_error)
     except Exception as e:
-        kafka_init_error = str(e)
+        kafka_producer_init_error = str(e)
         print(f"Erro ao inicializar Produtor Kafka: {e}")
 else:
-    kafka_init_error = "Biblioteca confluent_kafka não encontrada."
+    kafka_producer_init_error = "Biblioteca confluent_kafka não encontrada."
 
 def delivery_report(err, msg):
     if err is not None:
@@ -232,9 +232,7 @@ def delete_offer(offer_id):
     except Exception as e:
         return jsonify({"error": f"Erro ao deletar oferta: {e}"}), 500
 
-# --- Health Check (para Vercel) ---
-@app.route('/api/health', methods=['GET'])
-def health_check():
+def get_health_status():
     env_vars = {
         "FIREBASE_ADMIN_SDK_BASE64": "present" if os.environ.get('FIREBASE_ADMIN_SDK_BASE64') else "missing",
         "KAFKA_BOOTSTRAP_SERVER": "present" if os.environ.get('KAFKA_BOOTSTRAP_SERVER') else "missing",
@@ -249,11 +247,17 @@ def health_check():
         },
         "initialization_errors": {
             "firestore": firebase_init_error,
-            "kafka": kafka_init_error
+            "kafka_producer": kafka_producer_init_error
         }
     }
+    return status
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    status = get_health_status()
+    
     all_ok = (
-        all(value == "present" for value in env_vars.values()) and
+        all(value == "present" for value in status["environment_variables"].values()) and
         status["dependencies"]["firestore"] == "ok" and
         status["dependencies"]["kafka_producer"] == "ok"
     )
